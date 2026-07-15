@@ -12,14 +12,13 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
- * ww_md222 — 偵測模式 v2
+ * ww_md222 — 偵測模式（改回能用的 JSONObject.put hook）
  *
- * 改用 hook android.util.Base64.encode(byte[], int)，而非 JSONObject.put。
- * 原因：鳴潮 native 反作弊會自檢常見 Java 方法(如 JSONObject.put)是否被 hook，
- * 一旦發現就 native abort(閃退)。Base64.encode 較冷門，且 data 欄位最終
- * 一定經過它，攔這裡同樣能拿到明文 JSON。
+ * 重要：hook 點必須是 org.json.JSONObject.put —— 這是已驗證「不會觸發鳴潮
+ * native 反作弊」的點（第一次 patch 成功、無 crash 就是用這個）。
+ * 不要改 hook android.util.Base64，那會被 native 反作弊偵測到系統類被竄改而閃退。
  *
- * 偵測模式：只讀 storeCurrency / orderToken 區域，Toast 顯示，不改內容。
+ * 偵測模式：只讀 storeCurrency / orderToken 區域並 Toast 顯示，不改內容。
  */
 class MainHook : IXposedHookLoadPackage {
     companion object {
@@ -30,71 +29,63 @@ class MainHook : IXposedHookLoadPackage {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     @Volatile private var lastCurrency: String? = null
-    @Volatile private var lastRegionBlock: String? = null
     @Volatile private var lastToastAt: Long = 0
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PKG) return
         try {
-            log("=== ww_md222 loaded v2 (detect=$DETECT_ONLY) ===")
-            hookBase64(lpparam)
+            log("=== ww_md222 loaded (detect=$DETECT_ONLY) ===")
+            hookJsonPut(lpparam)
         } catch (t: Throwable) {
             log("install failed: ${t.message}")
         }
     }
 
-    private fun hookBase64(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // android.util.Base64.encode(byte[] input, int flags) : byte[]
+    private fun hookJsonPut(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
             XposedHelpers.findAndHookMethod(
-                "android.util.Base64", lpparam.classLoader,
-                "encode", ByteArray::class.java, Int::class.javaPrimitiveType,
+                "org.json.JSONObject", lpparam.classLoader,
+                "put", String::class.java, Any::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        try { val a = param.args; if (a != null && a.isNotEmpty()) inspect(a[0] as? ByteArray) } catch (_: Throwable) {}
+                        try { handlePut(param) } catch (_: Throwable) {}
                     }
                 }
             )
-            log("hook Base64.encode(byte[],int) installed")
+            log("hook installed")
         } catch (t: Throwable) {
-            log("hook encode(byte[],int) failed: ${t.message}")
-        }
-
-        // 備援：encodeToString(byte[], int)
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.util.Base64", lpparam.classLoader,
-                "encodeToString", ByteArray::class.java, Int::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try { val a = param.args; if (a != null && a.isNotEmpty()) inspect(a[0] as? ByteArray) } catch (_: Throwable) {}
-                    }
-                }
-            )
-            log("hook encodeToString installed")
-        } catch (t: Throwable) {
-            log("hook encodeToString failed: ${t.message}")
+            log("findAndHook failed: ${t.message}")
         }
     }
 
-    private fun inspect(data: ByteArray?) {
-        if (data == null || data.size < 50) return
-        // 快速過濾：只處理含 orderToken 的 payload
-        val text = try { String(data, Charsets.UTF_8) } catch (_: Throwable) { return }
-        if (!text.contains("orderToken")) return
+    private fun handlePut(param: XC_MethodHook.MethodHookParam) {
+        val args = param.args ?: return
+        if (args.size < 2) return
+        val key = args[0] as? String ?: return
+        val value = args[1]
 
-        // 讀 storeCurrency
-        val cur = Regex("\"storeCurrency\"\\s*:\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)
-        // 讀 orderToken 區域
-        val token = Regex("\"orderToken\"\\s*:\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)
-        val region = OrderTokenPatcher.readRegion(token)
-
-        if (cur != null) { lastCurrency = cur; log("storeCurrency = $cur") }
-        if (region != null) {
-            lastRegionBlock = region
-            log("region@416 = $region (${OrderTokenPatcher.guessRegion(region)})")
+        when (key) {
+            "storeCurrency" -> {
+                if (value is String && value.isNotEmpty()) {
+                    lastCurrency = value
+                    log("storeCurrency = $value")
+                    showRegionToast()
+                }
+            }
+            "orderToken" -> {
+                if (value is String) {
+                    val region = OrderTokenPatcher.readRegion(value)
+                    if (region != null) {
+                        log("region@416 = $region (${OrderTokenPatcher.guessRegion(region)})")
+                    }
+                    if (!DETECT_ONLY) {
+                        val patched = OrderTokenPatcher.patch(value) { log(it) }
+                        if (patched != null) args[1] = patched
+                    }
+                    showRegionToast()
+                }
+            }
         }
-        showRegionToast()
     }
 
     private fun currencyToRegion(cur: String?): String = when (cur?.uppercase()) {
@@ -107,7 +98,6 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun showRegionToast() {
         val cur = lastCurrency ?: return
-        // 防洪：2 秒內不重複跳
         val now = System.currentTimeMillis()
         if (now - lastToastAt < 2000) return
         lastToastAt = now
