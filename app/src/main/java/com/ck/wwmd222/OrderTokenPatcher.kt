@@ -25,6 +25,35 @@ object OrderTokenPatcher {
     private const val REGION_OFFSET = 416
     private const val REGION_LEN = 64  // 32 bytes = 64 hex chars
 
+    /**
+     * 唯讀：解出 orderToken 內部 offset 416 的地區 block（不修改）。
+     * 失敗回傳 null。
+     */
+    fun readRegion(orderToken: String?): String? {
+        if (orderToken.isNullOrEmpty()) return null
+        return try {
+            val compressed = android.util.Base64.decode(orderToken, android.util.Base64.DEFAULT)
+            if (compressed.size < 10) return null
+            val hexStr = String(inflate(compressed), Charsets.US_ASCII)
+            if (hexStr.length != 960) return null
+            hexStr.substring(REGION_OFFSET, REGION_OFFSET + REGION_LEN)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 根據 region block 猜測地區。目前只認得 TW（iOS 抄來的樣本）。
+     * 其他區都是未知密文，只能標記 UNKNOWN + 前綴供人工比對。
+     */
+    fun guessRegion(regionBlock: String?): String {
+        if (regionBlock == null) return "?"
+        return when (regionBlock) {
+            TW_BLOCK -> "TW(台灣)"
+            else -> "UNKNOWN(${regionBlock.take(12)}…)"
+        }
+    }
+
     fun patch(orderToken: String?, log: (String) -> Unit = {}): String? {
         if (orderToken.isNullOrEmpty()) return null
 
