@@ -26,7 +26,7 @@ class MainHook : IXposedHookLoadPackage {
         const val DETECT_ONLY = true
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     // 收集到的區域線索，湊齊一起顯示
     @Volatile private var lastCurrency: String? = null
